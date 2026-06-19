@@ -1,21 +1,29 @@
 const api = window.stickyNoteAPI;
 
+const tabsScroll = document.getElementById('tabsScroll');
+const noteTitleInput = document.getElementById('noteTitleInput');
 const textarea = document.getElementById('noteTextarea');
 const statusIndicator = document.getElementById('statusIndicator');
 const peerCountEl = document.getElementById('peerCount');
+const noteCountEl = document.getElementById('noteCount');
 const syncStatusEl = document.getElementById('syncStatus');
 const peersPanel = document.getElementById('peersPanel');
 const peersList = document.getElementById('peersList');
 const deviceInfoEl = document.getElementById('deviceInfo');
 const pinBtn = document.getElementById('pinBtn');
+const newNoteBtn = document.getElementById('newNoteBtn');
 const refreshBtn = document.getElementById('refreshBtn');
 const syncBtn = document.getElementById('syncBtn');
+const deleteNoteBtn = document.getElementById('deleteNoteBtn');
 const closePeersBtn = document.getElementById('closePeersBtn');
 const toast = document.getElementById('toast');
 
-let debounceTimer = null;
-let isApplyingRemote = false;
+let notes = [];
+let activeNoteId = null;
 let currentPeers = [];
+let isApplyingRemote = false;
+let contentDebounceTimer = null;
+let titleDebounceTimer = null;
 let toastTimer = null;
 let syncStatusTimer = null;
 
@@ -47,6 +55,12 @@ function setSyncStatus(text, type = 'normal') {
   }
 }
 
+function escapeHtml(str) {
+  const div = document.createElement('div');
+  div.textContent = str;
+  return div.innerHTML;
+}
+
 function updatePeerDisplay(peers) {
   currentPeers = peers;
   peerCountEl.textContent = `发现 ${peers.length} 台设备`;
@@ -70,26 +84,124 @@ function updatePeerDisplay(peers) {
   }
 }
 
-function escapeHtml(str) {
-  const div = document.createElement('div');
-  div.textContent = str;
-  return div.innerHTML;
+function renderTabs() {
+  const sorted = [...notes].sort((a, b) => a.order - b.order);
+  tabsScroll.innerHTML = '';
+
+  for (const note of sorted) {
+    const tab = document.createElement('div');
+    tab.className = 'tab-item' + (note.id === activeNoteId ? ' active' : '');
+    tab.dataset.noteId = note.id;
+
+    const title = document.createElement('span');
+    title.className = 'tab-title';
+    title.textContent = note.title || '未命名';
+    title.title = note.title || '未命名';
+
+    const closeBtn = document.createElement('span');
+    closeBtn.className = 'tab-close';
+    closeBtn.textContent = '×';
+    closeBtn.title = '删除便签';
+    closeBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      handleDeleteNote(note.id);
+    });
+
+    tab.appendChild(title);
+    tab.appendChild(closeBtn);
+
+    tab.addEventListener('click', () => {
+      if (note.id !== activeNoteId) {
+        switchNote(note.id);
+      }
+    });
+
+    tabsScroll.appendChild(tab);
+  }
+
+  const plusBtn = document.createElement('div');
+  plusBtn.className = 'tab-item new-tab';
+  plusBtn.textContent = '+';
+  plusBtn.title = '新建便签';
+  plusBtn.addEventListener('click', handleCreateNote);
+  tabsScroll.appendChild(plusBtn);
+
+  noteCountEl.textContent = `共 ${notes.length} 条便签`;
 }
+
+function getActiveNote() {
+  return notes.find(n => n.id === activeNoteId) || null;
+}
+
+function switchNote(noteId) {
+  activeNoteId = noteId;
+  const note = getActiveNote();
+  if (!note) return;
+
+  isApplyingRemote = true;
+  noteTitleInput.value = note.title || '';
+  textarea.value = note.content || '';
+  isApplyingRemote = false;
+
+  renderTabs();
+}
+
+async function handleCreateNote() {
+  try {
+    const note = await api.createNote();
+    showToast(`新建便签「${note.title}」`);
+  } catch (e) {
+    console.error('Create note error:', e);
+    showToast('创建失败');
+  }
+}
+
+async function handleDeleteNote(noteId) {
+  if (!confirm('确定要删除这条便签吗？此操作会同步到所有设备。')) {
+    return;
+  }
+  try {
+    const result = await api.deleteNote(noteId);
+    if (result.ok) {
+      showToast('便签已删除');
+    }
+  } catch (e) {
+    console.error('Delete note error:', e);
+    showToast('删除失败');
+  }
+}
+
+noteTitleInput.addEventListener('input', () => {
+  if (isApplyingRemote) return;
+  const note = getActiveNote();
+  if (!note || note.title === noteTitleInput.value) return;
+
+  if (titleDebounceTimer) clearTimeout(titleDebounceTimer);
+  titleDebounceTimer = setTimeout(async () => {
+    try {
+      if (!activeNoteId) return;
+      setSyncStatus('同步标题...', 'syncing');
+      await api.updateNoteTitle(activeNoteId, noteTitleInput.value);
+    } catch (e) {
+      console.error('Update title error:', e);
+    }
+  }, 200);
+});
 
 textarea.addEventListener('input', () => {
   if (isApplyingRemote) return;
+  const note = getActiveNote();
+  if (!note || note.content === textarea.value) return;
 
   setSyncStatus('正在同步...', 'syncing');
 
-  if (debounceTimer) clearTimeout(debounceTimer);
-  debounceTimer = setTimeout(async () => {
+  if (contentDebounceTimer) clearTimeout(contentDebounceTimer);
+  contentDebounceTimer = setTimeout(async () => {
     try {
-      const result = await api.sendContentChange(textarea.value);
-      if (result && result.ignored) {
-        return;
-      }
+      if (!activeNoteId) return;
+      await api.updateNoteContent(activeNoteId, textarea.value);
     } catch (e) {
-      console.error('Send content error:', e);
+      console.error('Update content error:', e);
     }
   }, 150);
 });
@@ -109,6 +221,8 @@ pinBtn.addEventListener('click', async () => {
   }
 });
 
+newNoteBtn.addEventListener('click', handleCreateNote);
+
 refreshBtn.addEventListener('click', async () => {
   try {
     await api.refreshPeers();
@@ -120,11 +234,17 @@ refreshBtn.addEventListener('click', async () => {
 
 syncBtn.addEventListener('click', async () => {
   try {
-    await api.requestSync();
-    setSyncStatus('请求同步中...', 'syncing');
-    showToast('已请求同步');
+    await api.requestFullSync();
+    setSyncStatus('请求全量同步...', 'syncing');
+    showToast('已请求全量同步');
   } catch (e) {
     console.error('Request sync error:', e);
+  }
+});
+
+deleteNoteBtn.addEventListener('click', () => {
+  if (activeNoteId) {
+    handleDeleteNote(activeNoteId);
   }
 });
 
@@ -136,33 +256,69 @@ closePeersBtn.addEventListener('click', () => {
   peersPanel.classList.remove('open');
 });
 
-api.onContentUpdate((data) => {
-  isApplyingRemote = true;
+function applyNotesFromRemote(incomingNotes, fromName) {
+  const oldActiveNote = getActiveNote();
+  const oldActiveStillExists = incomingNotes.some(n => n.id === activeNoteId);
 
-  const selectionStart = textarea.selectionStart;
-  const selectionEnd = textarea.selectionEnd;
-  const scrollTop = textarea.scrollTop;
+  notes = [...incomingNotes];
 
-  textarea.value = data.content || '';
+  let flashActive = false;
 
-  try {
-    textarea.setSelectionRange(
-      Math.min(selectionStart, textarea.value.length),
-      Math.min(selectionEnd, textarea.value.length)
-    );
-    textarea.scrollTop = scrollTop;
-  } catch (e) {}
+  if (!oldActiveStillExists && notes.length > 0) {
+    activeNoteId = notes[0].id;
+    flashActive = true;
+  }
 
-  textarea.classList.add('remote-update');
-  setTimeout(() => {
-    textarea.classList.remove('remote-update');
-  }, 600);
-
-  setSyncStatus(`接收自 ${data.from || '远程'}`, 'syncing');
-
-  setTimeout(() => {
+  if (flashActive || activeNoteId === null) {
+    isApplyingRemote = true;
+    const note = getActiveNote();
+    if (note) {
+      noteTitleInput.value = note.title || '';
+      textarea.value = note.content || '';
+    }
     isApplyingRemote = false;
-  }, 50);
+  } else {
+    const note = getActiveNote();
+    if (note && !isApplyingRemote) {
+      const oldTitle = noteTitleInput.value;
+      const oldContent = textarea.value;
+
+      if (note.title !== oldTitle) {
+        isApplyingRemote = true;
+        noteTitleInput.value = note.title || '';
+        isApplyingRemote = false;
+      }
+      if (note.content !== oldContent) {
+        isApplyingRemote = true;
+        const selStart = textarea.selectionStart;
+        const selEnd = textarea.selectionEnd;
+        const scrollTop = textarea.scrollTop;
+
+        textarea.value = note.content || '';
+        try {
+          textarea.setSelectionRange(
+            Math.min(selStart, textarea.value.length),
+            Math.min(selEnd, textarea.value.length)
+          );
+          textarea.scrollTop = scrollTop;
+        } catch (e) {}
+
+        textarea.classList.add('remote-update');
+        setTimeout(() => textarea.classList.remove('remote-update'), 600);
+        isApplyingRemote = false;
+      }
+    }
+  }
+
+  renderTabs();
+
+  if (fromName && fromName !== 'local') {
+    setSyncStatus(`接收自 ${fromName}`, 'syncing');
+  }
+}
+
+api.onNotesUpdate((data) => {
+  applyNotesFromRemote(data.notes || [], data.from || 'remote');
 });
 
 api.onPeersUpdate((peers) => {
@@ -171,6 +327,12 @@ api.onPeersUpdate((peers) => {
 
 async function init() {
   try {
+    const data = await api.getAllNotes();
+    notes = data.notes || [];
+    if (notes.length > 0) {
+      activeNoteId = notes[0].id;
+    }
+
     const info = await api.getAppInfo();
     const clockStr = info.lamportClock ? ` | Clock: ${info.lamportClock}` : '';
     deviceInfoEl.textContent = `本机: ${info.hostName} | IP: ${info.localIPs.join(', ')} | 端口: ${info.port} | ID: ${info.nodeId.slice(0, 8)}${clockStr}`;
@@ -179,6 +341,14 @@ async function init() {
     if (isTop) {
       pinBtn.classList.add('active');
     }
+
+    const active = getActiveNote();
+    if (active) {
+      noteTitleInput.value = active.title || '';
+      textarea.value = active.content || '';
+    }
+
+    renderTabs();
 
     setTimeout(() => {
       api.refreshPeers();

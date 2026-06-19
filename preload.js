@@ -1,8 +1,23 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('stickyNoteAPI', {
-  sendContentChange: (content) =>
-    ipcRenderer.invoke('content:change', { content }),
+  getAllNotes: () =>
+    ipcRenderer.invoke('notes:get-all'),
+
+  createNote: () =>
+    ipcRenderer.invoke('note:create'),
+
+  updateNoteTitle: (noteId, title) =>
+    ipcRenderer.invoke('note:update-title', { noteId, title }),
+
+  updateNoteContent: (noteId, content) =>
+    ipcRenderer.invoke('note:update-content', { noteId, content }),
+
+  updateNoteOrder: (noteId, order) =>
+    ipcRenderer.invoke('note:update-order', { noteId, order }),
+
+  deleteNote: (noteId) =>
+    ipcRenderer.invoke('note:delete', { noteId }),
 
   getAppInfo: () =>
     ipcRenderer.invoke('app:get-info'),
@@ -16,11 +31,11 @@ contextBridge.exposeInMainWorld('stickyNoteAPI', {
   refreshPeers: () =>
     ipcRenderer.invoke('peers:request-refresh'),
 
-  requestSync: () =>
-    ipcRenderer.invoke('content:request-sync'),
+  requestFullSync: () =>
+    ipcRenderer.invoke('notes:request-sync'),
 
-  onContentUpdate: (callback) => {
-    ipcRenderer.on('content:update', (event, data) => callback(data));
+  onNotesUpdate: (callback) => {
+    ipcRenderer.on('notes:update', (event, data) => callback(data));
   },
 
   onPeersUpdate: (callback) => {
@@ -28,7 +43,7 @@ contextBridge.exposeInMainWorld('stickyNoteAPI', {
   },
 
   removeAllListeners: () => {
-    ipcRenderer.removeAllListeners('content:update');
+    ipcRenderer.removeAllListeners('notes:update');
     ipcRenderer.removeAllListeners('peers:update');
   }
 });

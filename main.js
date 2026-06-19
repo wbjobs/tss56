@@ -10,25 +10,23 @@ const DISCOVERY_INTERVAL = 8000;
 const HEARTBEAT_INTERVAL = 5000;
 const PEER_TIMEOUT = 20000;
 
-const DEDUP_CACHE_MAX = 200;
-const SAME_CONTENT_SUPPRESS_MS = 2000;
-const REMOTE_UPDATE_COOLDOWN_MS = 1500;
+const DEDUP_CACHE_MAX = 500;
+const SAME_OP_SUPPRESS_MS = 2000;
+const REMOTE_UPDATE_COOLDOWN_MS = 800;
 
 const NODE_ID = crypto.randomBytes(8).toString('hex');
 
 let mainWindow = null;
 let udpSocket = null;
-let peers = new Map();
+const peers = new Map();
 
-let currentContent = '';
+const notes = new Map();
 let lamportClock = 0;
-let originNodeId = NODE_ID;
 
 const seenMessageIds = new Map();
-const lastBroadcastSignature = { hash: '', time: 0 };
+const lastBroadcastOps = new Map();
 let lastRemoteApplyTime = 0;
 
-let isApplyingRemote = false;
 let discoveryTimer = null;
 let heartbeatTimer = null;
 let peerCleanupTimer = null;
@@ -51,8 +49,8 @@ function generateMsgId() {
   return crypto.randomBytes(12).toString('hex');
 }
 
-function contentHash(str) {
-  return crypto.createHash('sha1').update(str || '').digest('hex');
+function generateNoteId() {
+  return crypto.randomBytes(8).toString('hex');
 }
 
 function tickClock(remoteClock) {
@@ -83,22 +81,228 @@ function isMessageDuplicate(msgId) {
   return false;
 }
 
-function versionCompare(rmtClock, rmtNodeId, rmtOrigin) {
-  if (rmtClock !== lamportClock) {
-    return rmtClock > lamportClock ? 1 : -1;
+function versionNewer(rmtClock, rmtOrigin, localClock, localOrigin) {
+  if (rmtClock !== localClock) {
+    return rmtClock > localClock;
   }
-  if (rmtOrigin !== originNodeId) {
-    return rmtOrigin > originNodeId ? 1 : -1;
+  return rmtOrigin > localOrigin;
+}
+
+function createDefaultNote() {
+  const id = generateNoteId();
+  tickClock();
+  return {
+    id,
+    title: '新便签',
+    content: '',
+    order: notes.size,
+    deleted: false,
+    clock: lamportClock,
+    origin: NODE_ID
+  };
+}
+
+function serializeNotes() {
+  return [...notes.values()];
+}
+
+function serializeActiveNotes() {
+  return [...notes.values()].filter(n => !n.deleted).sort((a, b) => a.order - b.order);
+}
+
+function broadcastNoteOp(op, noteId, payload) {
+  const note = notes.get(noteId);
+  if (!note) return;
+
+  tickClock();
+  note.clock = lamportClock;
+  note.origin = NODE_ID;
+
+  const opKey = `${op}:${noteId}:${JSON.stringify(payload)}`;
+  const now = Date.now();
+  const prev = lastBroadcastOps.get(opKey);
+  if (prev && now - prev < SAME_OP_SUPPRESS_MS) {
+    return;
   }
-  return rmtNodeId > NODE_ID ? 1 : (rmtNodeId < NODE_ID ? -1 : 0);
+  lastBroadcastOps.set(opKey, now);
+  if (lastBroadcastOps.size > 100) {
+    const sorted = [...lastBroadcastOps.entries()].sort((a, b) => a[1] - b[1]);
+    for (const [k] of sorted.slice(0, 25)) {
+      lastBroadcastOps.delete(k);
+    }
+  }
+
+  sendMessage({
+    type: 'NOTE_OP',
+    nodeId: NODE_ID,
+    lamportClock: lamportClock,
+    peerName: os.hostname(),
+    op,
+    noteId,
+    payload: applyOpPayload(op, payload, note),
+    noteClock: note.clock,
+    noteOrigin: note.origin
+  });
+
+  console.log(`[OP] ${op} note=${noteId.slice(0, 6)} clock=${note.clock}`);
+}
+
+function applyOpPayload(op, payload, note) {
+  switch (op) {
+    case 'create':
+      return {
+        title: note.title,
+        content: note.content,
+        order: note.order,
+        deleted: note.deleted
+      };
+    case 'update_title':
+      return { title: payload.title };
+    case 'update_content':
+      return { content: payload.content };
+    case 'update_order':
+      return { order: payload.order };
+    case 'delete':
+      return { deleted: true };
+    case 'restore':
+      return { deleted: false };
+    default:
+      return payload || {};
+  }
+}
+
+function applyRemoteNoteOp(op, noteId, payload, rmtClock, rmtOrigin) {
+  let note = notes.get(noteId);
+
+  if (!note) {
+    if (op === 'create') {
+      tickClock(rmtClock);
+      note = {
+        id: noteId,
+        title: payload.title || '未命名',
+        content: payload.content || '',
+        order: typeof payload.order === 'number' ? payload.order : notes.size,
+        deleted: !!payload.deleted,
+        clock: rmtClock,
+        origin: rmtOrigin
+      };
+      notes.set(noteId, note);
+      return true;
+    }
+    if (op === 'delete' && payload && payload.deleted) {
+      tickClock(rmtClock);
+      notes.set(noteId, {
+        id: noteId,
+        title: payload.title || '已删除',
+        content: '',
+        order: notes.size,
+        deleted: true,
+        clock: rmtClock,
+        origin: rmtOrigin
+      });
+      return true;
+    }
+    return false;
+  }
+
+  if (!versionNewer(rmtClock, rmtOrigin, note.clock, note.origin)) {
+    return false;
+  }
+
+  tickClock(rmtClock);
+  note.clock = rmtClock;
+  note.origin = rmtOrigin;
+
+  let changed = false;
+  switch (op) {
+    case 'create':
+      if (typeof payload.title !== undefined && note.title !== payload.title) {
+      note.title = payload.title; changed = true;
+    }
+    if (typeof payload.content !== undefined && note.content !== payload.content) {
+      note.content = payload.content; changed = true;
+    }
+    if (typeof payload.order === 'number' && note.order !== payload.order) {
+      note.order = payload.order; changed = true;
+    }
+    if (typeof payload.deleted === 'boolean' && note.deleted !== payload.deleted) {
+      note.deleted = payload.deleted; changed = true;
+    }
+    break;
+    case 'update_title':
+      if (payload && typeof payload.title === 'string' && note.title !== payload.title) {
+        note.title = payload.title;
+        changed = true;
+      }
+      break;
+    case 'update_content':
+      if (payload && typeof payload.content !== undefined && note.content !== payload.content) {
+        note.content = payload.content;
+        changed = true;
+      }
+      break;
+    case 'update_order':
+      if (payload && typeof payload.order === 'number' && note.order !== payload.order) {
+        note.order = payload.order;
+        changed = true;
+      }
+      break;
+    case 'delete':
+      if (!note.deleted) {
+        note.deleted = true;
+        changed = true;
+      }
+      break;
+    case 'restore':
+      if (note.deleted) {
+        note.deleted = false;
+        changed = true;
+      }
+      break;
+  }
+  return changed;
+}
+
+function applyFullState(remoteNotes) {
+  let anyChanged = false;
+  for (const rn of remoteNotes) {
+    if (!rn || !rn.id) continue;
+    const local = notes.get(rn.id);
+    if (!local) {
+      tickClock(rn.clock);
+      notes.set(rn.id, {
+        id: rn.id,
+        title: rn.title || '未命名',
+        content: rn.content || '',
+        order: typeof rn.order === 'number' ? rn.order : notes.size,
+        deleted: !!rn.deleted,
+        clock: rn.clock || 0,
+        origin: rn.origin || NODE_ID
+      });
+      anyChanged = true;
+      continue;
+    }
+    if (versionNewer(rn.clock, rn.origin, local.clock, local.origin)) {
+      tickClock(rn.clock);
+      let c = false;
+      if (local.title !== (rn.title || '')) { local.title = rn.title || ''; c = true; }
+      if (local.content !== (rn.content || '')) { local.content = rn.content || ''; c = true; }
+      if (typeof rn.order === 'number' && local.order !== rn.order) { local.order = rn.order; c = true; }
+      if (local.deleted !== !!rn.deleted) { local.deleted = !!rn.deleted; c = true; }
+      local.clock = rn.clock;
+      local.origin = rn.origin || NODE_ID;
+      if (c) anyChanged = true;
+    }
+  }
+  return anyChanged;
 }
 
 function createWindow() {
   mainWindow = new BrowserWindow({
-    width: 360,
-    height: 440,
-    minWidth: 280,
-    minHeight: 320,
+    width: 420,
+    height: 500,
+    minWidth: 340,
+    minHeight: 380,
     alwaysOnTop: true,
     title: '便签同步器',
     frame: true,
@@ -126,7 +330,7 @@ function createUdpSocket() {
       const data = JSON.parse(msg.toString());
       handleMessage(data, rinfo);
     } catch (e) {
-      console.error('Failed to parse UDP message:', e);
+        console.error('Failed to parse UDP message:', e);
     }
   });
 
@@ -162,17 +366,13 @@ function sendMessage(data, address = BROADCAST_ADDR) {
 
 function handleMessage(data, rinfo) {
   if (!data || !data.type) return;
-
   if (data.nodeId === NODE_ID) return;
-
-  if (data.msgId && isMessageDuplicate(data.msgId)) {
-    return;
-  }
+  if (data.msgId && isMessageDuplicate(data.msgId)) return;
 
   const peerKey = `${rinfo.address}:${data.nodeId}`;
   const now = Date.now();
 
-  if (['DISCOVERY', 'HEARTBEAT', 'SYNC', 'CONTENT_REQ', 'ACK'].includes(data.type)) {
+  if (['DISCOVERY', 'HEARTBEAT', 'NOTE_OP', 'FULL_STATE', 'STATE_REQ'].includes(data.type)) {
     peers.set(peerKey, {
       address: rinfo.address,
       nodeId: data.nodeId,
@@ -185,19 +385,16 @@ function handleMessage(data, rinfo) {
     case 'DISCOVERY':
       handleDiscovery(data, rinfo);
       break;
-
     case 'HEARTBEAT':
       break;
-
-    case 'SYNC':
-      handleSync(data, rinfo);
+    case 'NOTE_OP':
+      handleNoteOp(data, rinfo);
       break;
-
-    case 'CONTENT_REQ':
-      sendSyncTo(rinfo.address);
+    case 'FULL_STATE':
+      handleFullState(data, rinfo);
       break;
-
-    case 'ACK':
+    case 'STATE_REQ':
+      sendFullStateTo(rinfo.address);
       break;
   }
 
@@ -209,107 +406,54 @@ function handleDiscovery(data, rinfo) {
   if (rmtClock > lamportClock) {
     lamportClock = rmtClock;
   }
+  setTimeout(() => sendFullStateTo(rinfo.address), 50 + Math.random() * 150);
+}
 
-  if (currentContent && (data.lamportClock || 0) < lamportClock) {
-    setTimeout(() => sendSyncTo(rinfo.address), 100 + Math.random() * 200);
-  } else if (!currentContent && data.content) {
-    handleSync(data, rinfo);
-  } else if (currentContent) {
-    setTimeout(() => sendSyncTo(rinfo.address), 50 + Math.random() * 150);
+function handleNoteOp(data, rinfo) {
+  const { op, noteId, payload, noteClock, noteOrigin } = data;
+  if (!op || !noteId) return;
+  const rmtClock = typeof noteClock === 'number' ? noteClock : (data.lamportClock || 0);
+  const rmtOrigin = noteOrigin || data.nodeId;
+
+  const now = Date.now();
+  if (now - lastRemoteApplyTime < REMOTE_UPDATE_COOLDOWN_MS && notes.size > 0) {
+    // still proceed but delayed
+  }
+
+  const changed = applyRemoteNoteOp(op, noteId, payload, rmtClock, rmtOrigin);
+
+  if (changed) {
+    lastRemoteApplyTime = now;
+    pushStateToRenderer(data.peerName || rinfo.address);
   }
 }
 
-function handleSync(data, rinfo) {
-  const rmtContent = data.content || '';
-  const rmtClock = typeof data.lamportClock === 'number' ? data.lamportClock : (data.timestamp || 0);
-  const rmtOrigin = data.originNodeId || data.nodeId;
-  const rmtNodeId = data.nodeId;
-
-  if (rmtClock > lamportClock) {
-    lamportClock = rmtClock;
-  }
-
-  if (rmtContent === currentContent) {
-    if (rmtClock >= lamportClock) {
-      originNodeId = rmtOrigin;
-    }
-    return;
-  }
-
-  const cmp = versionCompare(rmtClock, rmtNodeId, rmtOrigin);
-
-  if (cmp > 0) {
-    lamportClock = rmtClock;
-    originNodeId = rmtOrigin;
-    currentContent = rmtContent;
-    lastRemoteApplyTime = Date.now();
-    isApplyingRemote = true;
-
-    if (mainWindow) {
-      mainWindow.webContents.send('content:update', {
-        content: currentContent,
-        lamportClock: lamportClock,
-        originNodeId: originNodeId,
-        from: data.peerName || rinfo.address
-      });
-    }
-
-    setTimeout(() => {
-      isApplyingRemote = false;
-    }, 100);
-
-    return;
-  }
-
-  if (cmp < 0) {
-    const now = Date.now();
-    if (now - lastRemoteApplyTime < REMOTE_UPDATE_COOLDOWN_MS) {
-      return;
-    }
-    if (lastBroadcastSignature.hash === contentHash(currentContent) &&
-        now - lastBroadcastSignature.time < SAME_CONTENT_SUPPRESS_MS) {
-      return;
-    }
-    setTimeout(() => {
-      broadcastContent();
-    }, 50 + Math.random() * 150);
+function handleFullState(data, rinfo) {
+  if (!Array.isArray(data.notes)) return;
+  const changed = applyFullState(data.notes);
+  if (changed) {
+    pushStateToRenderer(data.peerName || rinfo.address);
   }
 }
 
-function sendSyncTo(address) {
-  if (!udpSocket) return;
+function sendFullStateTo(address) {
   sendMessage({
-    type: 'SYNC',
+    type: 'FULL_STATE',
     nodeId: NODE_ID,
     lamportClock: lamportClock,
-    originNodeId: originNodeId,
-    content: currentContent,
-    peerName: os.hostname()
+    peerName: os.hostname(),
+    notes: serializeNotes()
   }, address);
 }
 
-function broadcastContent() {
-  const hash = contentHash(currentContent);
-  const now = Date.now();
-
-  if (lastBroadcastSignature.hash === hash &&
-      now - lastBroadcastSignature.time < SAME_CONTENT_SUPPRESS_MS) {
-    return;
-  }
-
-  lastBroadcastSignature.hash = hash;
-  lastBroadcastSignature.time = now;
-
+function broadcastFullState() {
   sendMessage({
-    type: 'SYNC',
+    type: 'FULL_STATE',
     nodeId: NODE_ID,
     lamportClock: lamportClock,
-    originNodeId: originNodeId,
-    content: currentContent,
-    peerName: os.hostname()
+    peerName: os.hostname(),
+    notes: serializeNotes()
   });
-
-  console.log(`[BROADCAST] clock=${lamportClock} origin=${originNodeId.slice(0, 6)} len=${currentContent.length}`);
 }
 
 function broadcastDiscovery() {
@@ -317,9 +461,7 @@ function broadcastDiscovery() {
     type: 'DISCOVERY',
     nodeId: NODE_ID,
     peerName: os.hostname(),
-    lamportClock: lamportClock,
-    originNodeId: originNodeId,
-    content: currentContent
+    lamportClock: lamportClock
   });
 }
 
@@ -328,6 +470,14 @@ function broadcastHeartbeat() {
     type: 'HEARTBEAT',
     nodeId: NODE_ID,
     peerName: os.hostname()
+  });
+}
+
+function pushStateToRenderer(fromName) {
+  if (!mainWindow) return;
+  mainWindow.webContents.send('notes:update', {
+    notes: serializeActiveNotes(),
+    from: fromName || 'remote'
   });
 }
 
@@ -348,7 +498,7 @@ function cleanupPeers() {
 function cleanupDedupCache() {
   if (seenMessageIds.size <= DEDUP_CACHE_MAX) return;
   const now = Date.now();
-  const cutoff = now - 60000;
+  const cutoff = now - 120000;
   for (const [k, t] of seenMessageIds.entries()) {
     if (t < cutoff) {
       seenMessageIds.delete(k);
@@ -368,21 +518,82 @@ function updatePeersOnUI() {
   mainWindow.webContents.send('peers:update', peerList);
 }
 
+function ensureAtLeastOneNote() {
+  const actives = serializeActiveNotes();
+  if (actives.length === 0) {
+    const note = createDefaultNote();
+    notes.set(note.id, note);
+    return note.id;
+  }
+  return actives[0].id;
+}
+
 function setupIPC() {
-  ipcMain.handle('content:change', (event, { content }) => {
-    if (isApplyingRemote) return { ignored: true };
+  ipcMain.handle('notes:get-all', () => {
+    ensureAtLeastOneNote();
+    return {
+      notes: serializeActiveNotes(),
+    nodeId: NODE_ID,
+    lamportClock: lamportClock
+    };
+  });
 
-    if (content === currentContent) {
-      return { timestamp: lamportClock, unchanged: true };
-    }
+  ipcMain.handle('note:create', () => {
+    const note = createDefaultNote();
+    notes.set(note.id, note);
+    broadcastNoteOp('create', note.id, {});
+    pushStateToRenderer('local');
+    return note;
+  });
 
+  ipcMain.handle('note:update-title', (event, { noteId, title }) => {
+    const note = notes.get(noteId);
+    if (!note || note.title === title) return { ok: false };
     tickClock();
-    originNodeId = NODE_ID;
-    currentContent = content;
+    note.title = title;
+    note.clock = lamportClock;
+    note.origin = NODE_ID;
+    broadcastNoteOp('update_title', noteId, { title });
+    pushStateToRenderer('local');
+    return { ok: true, clock: note.clock };
+  });
 
-    broadcastContent();
+  ipcMain.handle('note:update-content', (event, { noteId, content }) => {
+    const note = notes.get(noteId);
+    if (!note || note.content === content) return { ok: false };
+    tickClock();
+    note.content = content;
+    note.clock = lamportClock;
+    note.origin = NODE_ID;
+    broadcastNoteOp('update_content', noteId, { content });
+    pushStateToRenderer('local');
+    return { ok: true, clock: note.clock };
+  });
 
-    return { timestamp: lamportClock, originNodeId: NODE_ID };
+  ipcMain.handle('note:update-order', (event, { noteId, order }) => {
+    const note = notes.get(noteId);
+    if (!note || note.order === order) return { ok: false };
+    tickClock();
+    note.order = order;
+    note.clock = lamportClock;
+    note.origin = NODE_ID;
+    broadcastNoteOp('update_order', noteId, { order });
+    pushStateToRenderer('local');
+    return { ok: true, clock: note.clock };
+  });
+
+  ipcMain.handle('note:delete', (event, { noteId }) => {
+    const note = notes.get(noteId);
+    if (!note || note.deleted) return { ok: false };
+    tickClock();
+    note.deleted = true;
+    note.clock = lamportClock;
+    note.origin = NODE_ID;
+    broadcastNoteOp('delete', noteId, {});
+    const active = serializeActiveNotes();
+    const nextId = active.length > 0 ? active[0].id : null;
+    pushStateToRenderer('local');
+    return { ok: true, nextActiveId: nextId };
   });
 
   ipcMain.handle('app:get-info', () => {
@@ -393,6 +604,7 @@ function setupIPC() {
       port: UDP_PORT,
       lamportClock: lamportClock,
       peerCount: peers.size,
+      noteCount: serializeActiveNotes().length,
       dedupCacheSize: seenMessageIds.size
     };
   });
@@ -415,13 +627,18 @@ function setupIPC() {
     return true;
   });
 
-  ipcMain.handle('content:request-sync', () => {
-    broadcastDiscovery();
+  ipcMain.handle('notes:request-sync', () => {
+    sendMessage({
+      type: 'STATE_REQ',
+      nodeId: NODE_ID,
+      peerName: os.hostname()
+    });
     return true;
   });
 }
 
 app.whenReady().then(() => {
+  ensureAtLeastOneNote();
   createWindow();
   createUdpSocket();
   setupIPC();
