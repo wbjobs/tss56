@@ -1,0 +1,22 @@
+{
+  "name": "sticky-note-sync",
+  "version": "1.0.0",
+  "description": "便签同步器 - 局域网内无服务器UDP广播实时同步便签",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron ."
+  },
+  "keywords": [
+    "electron",
+    "sticky-note",
+    "udp",
+    "sync",
+    "p2p"
+  ],
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "electron": "^28.0.0"
+  }
+}

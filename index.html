@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>便签同步器</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="app-container">
+    <header class="toolbar">
+      <div class="toolbar-left">
+        <span class="status-indicator" id="statusIndicator" title="同步状态"></span>
+        <span class="title-label">便签同步器</span>
+      </div>
+      <div class="toolbar-right">
+        <button class="tool-btn" id="pinBtn" title="置顶切换">📌</button>
+        <button class="tool-btn" id="refreshBtn" title="刷新设备列表">🔄</button>
+        <button class="tool-btn" id="syncBtn" title="请求同步">⟳</button>
+      </div>
+    </header>
+
+    <div class="content-area">
+      <textarea
+        id="noteTextarea"
+        class="note-textarea"
+        placeholder="在这里输入便签内容...&#10;&#10;同一局域网内的其他设备会实时同步你输入的文字。"
+        spellcheck="false"
+      ></textarea>
+    </div>
+
+    <footer class="status-bar">
+      <div class="status-left">
+        <span id="peerCount">发现 0 台设备</span>
+      </div>
+      <div class="status-right">
+        <span id="syncStatus">就绪</span>
+      </div>
+    </footer>
+
+    <div class="peers-panel" id="peersPanel">
+      <div class="peers-header">
+        <span>在线设备</span>
+        <button class="close-btn" id="closePeersBtn">×</button>
+      </div>
+      <div class="peers-list" id="peersList">
+        <div class="peer-item empty">暂无设备</div>
+      </div>
+      <div class="device-info" id="deviceInfo"></div>
+    </div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+  <script src="renderer.js"></script>
+</body>
+</html>
