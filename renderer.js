@@ -172,7 +172,8 @@ api.onPeersUpdate((peers) => {
 async function init() {
   try {
     const info = await api.getAppInfo();
-    deviceInfoEl.textContent = `本机: ${info.hostName} | IP: ${info.localIPs.join(', ')} | 端口: ${info.port} | ID: ${info.nodeId.slice(0, 8)}`;
+    const clockStr = info.lamportClock ? ` | Clock: ${info.lamportClock}` : '';
+    deviceInfoEl.textContent = `本机: ${info.hostName} | IP: ${info.localIPs.join(', ')} | 端口: ${info.port} | ID: ${info.nodeId.slice(0, 8)}${clockStr}`;
 
     const isTop = await api.isAlwaysOnTop();
     if (isTop) {
@@ -182,6 +183,14 @@ async function init() {
     setTimeout(() => {
       api.refreshPeers();
     }, 500);
+
+    setInterval(async () => {
+      try {
+        const fresh = await api.getAppInfo();
+        const cStr = fresh.lamportClock ? ` | Clock: ${fresh.lamportClock}` : '';
+        deviceInfoEl.textContent = `本机: ${fresh.hostName} | IP: ${fresh.localIPs.join(', ')} | 端口: ${fresh.port} | ID: ${fresh.nodeId.slice(0, 8)}${cStr}`;
+      } catch (e) {}
+    }, 5000);
   } catch (e) {
     console.error('Init error:', e);
     deviceInfoEl.textContent = '初始化失败';
